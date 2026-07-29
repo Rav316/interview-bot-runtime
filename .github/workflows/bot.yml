@@ -119,5 +119,3 @@ jobs:
               commit --quiet --allow-empty -m "tick $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git push --quiet --force origin HEAD:heartbeat
           echo "Следующий прогон запущен."
-
-# Перерегистрация workflow в индексе GitHub.

@@ -1,0 +1,121 @@
+name: bot
+
+on:
+  # Основной триггер: последний шаг прогона пушит пустой коммит в heartbeat
+  # deploy-ключом, и это поднимает следующий прогон. GITHUB_TOKEN так не умеет
+  # (защита от рекурсии), deploy-ключ — умеет.
+  push:
+    branches: [heartbeat]
+  workflow_dispatch:
+  # Подстраховка, если цепочка порвалась. Cron работает только с main.
+  schedule:
+    - cron: "7 */6 * * *"
+
+# Один бот на токен: второй polling получил бы 409 Conflict от Telegram.
+# Новый прогон встаёт в очередь и стартует после завершения текущего.
+concurrency:
+  group: bot-runtime
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      # Раннеры GitHub — в США, поэтому Gemini доступен без прокси.
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      OWNER_ID: ${{ vars.OWNER_ID }}
+      TZ: Europe/Moscow
+      QUIET_START: "9"
+      QUIET_END: "22"
+      CODE_REPO: ${{ vars.CODE_REPO }}
+      DATA_REPO: ${{ vars.DATA_REPO }}
+      RUN_SECONDS: "20400"   # 5ч40м работы, ~15 мин запаса до timeout-minutes
+      SNAPSHOT_EVERY: "600"  # снимок БД раз в 10 минут
+
+    steps:
+      # actions/checkout не нужен: в этом репозитории нет ничего, кроме workflow.
+      - name: Setup deploy keys
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.CODE_DEPLOY_KEY }}" > ~/.ssh/code_key
+          printf '%s\n' "${{ secrets.DATA_DEPLOY_KEY }}" > ~/.ssh/data_key
+          printf '%s\n' "${{ secrets.TRIGGER_DEPLOY_KEY }}" > ~/.ssh/trigger_key
+          chmod 600 ~/.ssh/code_key ~/.ssh/data_key ~/.ssh/trigger_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      # Код живёт в приватном репозитории: так его не форкнуть, а минуты
+      # списываются с этого — публичного, где они безлимитны.
+      - name: Clone app
+        run: |
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/code_key -o IdentitiesOnly=yes"
+          git clone --quiet --depth 1 "git@github.com:${CODE_REPO}.git" app
+          echo "Код получен, коммит $(git -C app rev-parse --short HEAD)."
+
+      # Клон обязан быть раньше: кеш pip читает app/pyproject.toml.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: app/pyproject.toml
+
+      - name: Install deps
+        working-directory: app
+        run: pip install -e .
+
+      - name: Restore DB
+        working-directory: app
+        run: bash .github/scripts/db_sync.sh restore
+
+      - name: Run bot
+        id: run
+        working-directory: app
+        run: |
+          # Вывод в файл, а не в пайп шага: иначе фоновый sleep держал бы шаг
+          # открытым после остановки бота.
+          bash .github/scripts/db_sync.sh watch > snapshot.log 2>&1 &
+          watch_pid=$!
+          started=$(date +%s)
+          set +e
+          timeout --signal=INT --kill-after=60 "$RUN_SECONDS" python main.py
+          code=$?
+          set -e
+          kill "$watch_pid" 2>/dev/null || true
+          echo "elapsed=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+          echo "Бот остановлен, код выхода $code."
+          echo "--- лог снимков БД ---"
+          cat snapshot.log || true
+
+      - name: Backup DB
+        if: always()
+        run: |
+          # Клон мог не состояться — тогда снимать нечего, но и падать незачем.
+          if [ -d app ]; then
+            cd app && bash .github/scripts/db_sync.sh backup
+          else
+            echo "Каталог app отсутствует — снимок пропущен."
+          fi
+
+      - name: Restart workflow
+        if: always()
+        run: |
+          elapsed="${{ steps.run.outputs.elapsed }}"
+          if [ "${elapsed:-0}" -lt 300 ]; then
+            echo "Прогон короче 5 минут — пауза, чтобы не устроить петлю перезапусков."
+            sleep 300
+          fi
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/trigger_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          tmp=$(mktemp -d)
+          git clone --quiet --depth 1 --branch main \
+            "git@github.com:${{ github.repository }}.git" "$tmp/repo"
+          cd "$tmp/repo"
+          # heartbeat = main + один пустой коммит. Force-push => ветка не растёт,
+          # а свежий SHA каждый раз даёт push-событие.
+          git -c user.name="bot-runtime" \
+              -c user.email="bot-runtime@users.noreply.github.com" \
+              commit --quiet --allow-empty -m "tick $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push --quiet --force origin HEAD:heartbeat
+          echo "Следующий прогон запущен."
